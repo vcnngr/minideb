@@ -251,8 +251,8 @@ Workspace:    ${env.WORKSPACE}
                                         echo "Using existing timestamp: \${TIMESTAMP}"
                                     fi
                                     
-                                    # Execute import script with bash
-                                    IMAGE_ID=\$(bash ./import "build/${DIST_NAME}-${ARCH_NAME}.tar" "\${TIMESTAMP}" "${ARCH_NAME}")
+                                    # Execute import script with sh (Alpine Linux)
+                                    IMAGE_ID=\$(sh ./import "build/${DIST_NAME}-${ARCH_NAME}.tar" "\${TIMESTAMP}" "${ARCH_NAME}")
                                     
                                     if [ -z "\${IMAGE_ID}" ]; then
                                         echo "ERROR: Failed to import image"
