@@ -188,22 +188,39 @@ Namespace:    jenkins
                 }
                 
                 stage('SonarQube') {
+                    when {
+                        expression { 
+                            // SonarQube opzionale - non blocca se non configurato
+                            try {
+                                return env.SONARQUBE_SERVER != null
+                            } catch (Exception e) {
+                                return false
+                            }
+                        }
+                    }
                     steps {
                         container('debian') {
-                            withSonarQubeEnv('SonarQube-Server') {
-                                sh '''
-                                    curl -sSLo /tmp/sonar-scanner.zip \
-                                        https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
-                                    unzip -q /tmp/sonar-scanner.zip -d /opt
-                                    
-                                    /opt/sonar-scanner-*/bin/sonar-scanner \
-                                        -Dsonar.projectKey=vcnngr-minideb \
-                                        -Dsonar.projectName='VCNNGR MinidEB' \
-                                        -Dsonar.projectVersion=${BUILD_DATE}-${GIT_COMMIT_SHORT} \
-                                        -Dsonar.sources=. \
-                                        -Dsonar.exclusions='**/*.md,build/**,**/.github/**,**/.git/**' \
-                                        -Dsonar.sourceEncoding=UTF-8
-                                '''
+                            script {
+                                try {
+                                    withSonarQubeEnv('SonarQube-Server') {
+                                        sh '''
+                                            curl -sSLo /tmp/sonar-scanner.zip \
+                                                https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
+                                            unzip -q /tmp/sonar-scanner.zip -d /opt
+                                            
+                                            /opt/sonar-scanner-*/bin/sonar-scanner \
+                                                -Dsonar.projectKey=vcnngr-minideb \
+                                                -Dsonar.projectName='VCNNGR MinidEB' \
+                                                -Dsonar.projectVersion=${BUILD_DATE}-${GIT_COMMIT_SHORT} \
+                                                -Dsonar.sources=. \
+                                                -Dsonar.exclusions='**/*.md,build/**,**/.github/**,**/.git/**' \
+                                                -Dsonar.sourceEncoding=UTF-8
+                                        '''
+                                    }
+                                } catch (Exception e) {
+                                    echo "WARNING: SonarQube analysis failed: ${e.message}"
+                                    echo "Continuing build without SonarQube"
+                                }
                             }
                         }
                     }
@@ -212,12 +229,26 @@ Namespace:    jenkins
         }
         
         stage('Quality Gate') {
+            when {
+                expression { 
+                    // Quality Gate solo se SonarQube è configurato
+                    try {
+                        return env.SONARQUBE_SERVER != null
+                    } catch (Exception e) {
+                        return false
+                    }
+                }
+            }
             steps {
                 timeout(time: 10, unit: 'MINUTES') {
                     script {
-                        def qg = waitForQualityGate()
-                        if (qg.status != 'OK') {
-                            echo "WARNING: Quality Gate ${qg.status}"
+                        try {
+                            def qg = waitForQualityGate()
+                            if (qg.status != 'OK') {
+                                echo "WARNING: Quality Gate ${qg.status}"
+                            }
+                        } catch (Exception e) {
+                            echo "WARNING: Quality Gate check failed: ${e.message}"
                         }
                     }
                 }
