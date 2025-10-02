@@ -1,0 +1,19 @@
+#!/bin/bash
+# Wrapper for buildone in Kubernetes with separate docker container
+
+set -e
+set -u
+
+DIST=${1:?}
+PLATFORM=${2:-amd64}
+BASENAME=vcnngr/minideb
+
+mkdir -p build
+
+# Step 1: Build tarball (no docker needed)
+echo "Creating base image tarball..."
+./mkimage "build/${DIST}-${PLATFORM}.tar" "$DIST" "$PLATFORM"
+
+# Step 2: Import will be done by calling docker container
+echo "Tarball ready at build/${DIST}-${PLATFORM}.tar"
+echo "Run import from docker container"
