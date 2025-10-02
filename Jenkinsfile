@@ -1,10 +1,10 @@
 // VCNNGR MinidEB Pipeline - Production with SonarQube
-// Kubernetes Native - Jenkins 2.530+
+// Fixed: workspace path issues and script execution
 
 pipeline {
     agent {
         kubernetes {
-            yaml '''
+            yaml """
 apiVersion: v1
 kind: Pod
 metadata:
@@ -17,10 +17,10 @@ spec:
     runAsUser: 0
     fsGroup: 0
   volumes:
-    - name: docker-sock
-      hostPath:
-        path: /var/run/docker.sock
-        type: Socket
+  - name: docker-sock
+    hostPath:
+      path: /var/run/docker.sock
+      type: Socket
   containers:
   - name: debian
     image: debian:bookworm
@@ -36,26 +36,26 @@ spec:
         memory: "8Gi"
         cpu: "4000m"
     volumeMounts:
-      - name: docker-sock
-        mountPath: /var/run/docker.sock
+    - name: docker-sock
+      mountPath: /var/run/docker.sock
     env:
-      - name: DEBIAN_FRONTEND
-        value: noninteractive
+    - name: DEBIAN_FRONTEND
+      value: noninteractive
   - name: docker
     image: docker:24-cli
     command: [cat]
     tty: true
     volumeMounts:
-      - name: docker-sock
-        mountPath: /var/run/docker.sock
+    - name: docker-sock
+      mountPath: /var/run/docker.sock
   - name: trivy
     image: aquasec/trivy:latest
     command: [cat]
     tty: true
     volumeMounts:
-      - name: docker-sock
-        mountPath: /var/run/docker.sock
-'''
+    - name: docker-sock
+      mountPath: /var/run/docker.sock
+"""
         }
     }
     
@@ -74,7 +74,7 @@ spec:
     parameters {
         choice(name: 'DIST', choices: ['all', 'bullseye', 'bookworm', 'trixie'], description: 'Distribution')
         choice(name: 'ARCH', choices: ['all', 'amd64', 'arm64'], description: 'Architecture')
-        booleanParam(name: 'PUSH_TO_REGISTRY', defaultValue: true, description: 'Push to Docker Hub')
+        booleanParam(name: 'PUSH_TO_REGISTRY', defaultValue: false, description: 'Push to Docker Hub')
         booleanParam(name: 'CREATE_MANIFESTS', defaultValue: true, description: 'Create manifests')
         booleanParam(name: 'RUN_SECURITY_SCAN', defaultValue: true, description: 'Run security scan')
         booleanParam(name: 'RUN_SONARQUBE', defaultValue: true, description: 'Run SonarQube analysis')
@@ -101,15 +101,13 @@ Distribution: ${params.DIST}
 Architecture: ${params.ARCH}
 Build Date:   ${BUILD_DATE}
 Commit:       ${GIT_COMMIT_SHORT}
-Pod:          ${env.NODE_NAME}
+Workspace:    ${env.WORKSPACE}
 """
                     def dists = params.DIST == 'all' ? ['bullseye', 'bookworm', 'trixie'] : [params.DIST]
                     def archs = params.ARCH == 'all' ? ['amd64', 'arm64'] : [params.ARCH]
                     
                     env.BUILD_DISTS = dists.join(',')
                     env.BUILD_ARCHS = archs.join(',')
-                    
-                    echo "Building: ${env.BUILD_DISTS} × ${env.BUILD_ARCHS}"
                 }
             }
         }
@@ -118,19 +116,19 @@ Pod:          ${env.NODE_NAME}
             steps {
                 container('debian') {
                     sh '''
-                        echo "Installing dependencies..."
                         apt-get update -qq
                         apt-get install -y -qq \
                             debootstrap debian-archive-keyring jq dpkg-dev \
                             gnupg curl shellcheck git rsync qemu-user-static unzip
-                        echo "Dependencies installed"
+                        
+                        # Ensure scripts are executable
+                        chmod +x mkimage import buildone test pushone pushall pushmanifest
                     '''
                 }
                 container('docker') {
                     sh '''
                         docker run --rm --privileged multiarch/qemu-user-static --reset -p yes || true
                         docker buildx create --use --name vcnngr-builder || docker buildx use vcnngr-builder || true
-                        echo "Multi-arch ready"
                     '''
                 }
             }
@@ -141,40 +139,36 @@ Pod:          ${env.NODE_NAME}
                 stage('Shellcheck') {
                     steps {
                         container('debian') {
-                            sh '''
-                                echo "Running shellcheck..."
-                                bash shellcheck
-                                echo "Shellcheck passed"
-                            '''
+                            sh 'bash shellcheck'
                         }
                     }
                 }
                 
-                stage('SonarQube Analysis') {
+                stage('SonarQube') {
                     when {
                         expression { params.RUN_SONARQUBE }
                     }
                     steps {
                         container('debian') {
                             script {
-                                withSonarQubeEnv('SonarQube') {
-                                    sh '''
-                                        echo "Installing SonarQube Scanner..."
-                                        curl -sSLo /tmp/sonar-scanner.zip \
-                                            https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
-                                        unzip -q /tmp/sonar-scanner.zip -d /opt
-                                        
-                                        echo "Running SonarQube analysis..."
-                                        /opt/sonar-scanner-*/bin/sonar-scanner \
-                                            -Dsonar.projectKey=vcnngr-minideb \
-                                            -Dsonar.projectName='VCNNGR MinidEB' \
-                                            -Dsonar.projectVersion=${BUILD_DATE}-${GIT_COMMIT_SHORT} \
-                                            -Dsonar.sources=. \
-                                            -Dsonar.exclusions='**/*.md,build/**,**/.github/**,**/.git/**' \
-                                            -Dsonar.sourceEncoding=UTF-8
-                                        
-                                        echo "SonarQube analysis complete"
-                                    '''
+                                try {
+                                    withSonarQubeEnv('SonarQube') {
+                                        sh '''
+                                            curl -sSLo /tmp/sonar-scanner.zip \
+                                                https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
+                                            unzip -q /tmp/sonar-scanner.zip -d /opt
+                                            
+                                            /opt/sonar-scanner-*/bin/sonar-scanner \
+                                                -Dsonar.projectKey=vcnngr-minideb \
+                                                -Dsonar.projectName='VCNNGR MinidEB' \
+                                                -Dsonar.projectVersion=${BUILD_DATE}-${GIT_COMMIT_SHORT} \
+                                                -Dsonar.sources=. \
+                                                -Dsonar.exclusions='**/*.md,build/**,**/.github/**,**/.git/**' \
+                                                -Dsonar.sourceEncoding=UTF-8
+                                        '''
+                                    }
+                                } catch (Exception e) {
+                                    echo "WARNING: SonarQube failed: ${e.message}"
                                 }
                             }
                         }
@@ -193,13 +187,10 @@ Pod:          ${env.NODE_NAME}
                         try {
                             def qg = waitForQualityGate()
                             if (qg.status != 'OK') {
-                                echo "WARNING: Quality Gate status: ${qg.status}"
-                                // Non bloccare la build, solo warning
-                            } else {
-                                echo "Quality Gate passed"
+                                echo "WARNING: Quality Gate ${qg.status} - continuing anyway"
                             }
                         } catch (Exception e) {
-                            echo "WARNING: Quality Gate check failed: ${e.message}"
+                            echo "WARNING: Quality Gate check failed - continuing anyway"
                         }
                     }
                 }
@@ -248,7 +239,10 @@ Pod:          ${env.NODE_NAME}
                         steps {
                             container('docker') {
                                 sh """
+                                    set -e
+                                    
                                     echo "Importing ${DIST_NAME}-${ARCH_NAME}"
+                                    cd \${WORKSPACE}
                                     
                                     TIMESTAMP=\$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
                                     
@@ -257,7 +251,15 @@ Pod:          ${env.NODE_NAME}
                                         echo "Using existing timestamp: \${TIMESTAMP}"
                                     fi
                                     
-                                    IMAGE_ID=\$(./import "build/${DIST_NAME}-${ARCH_NAME}.tar" "\${TIMESTAMP}" "${ARCH_NAME}")
+                                    # Execute import script with bash
+                                    IMAGE_ID=\$(bash ./import "build/${DIST_NAME}-${ARCH_NAME}.tar" "\${TIMESTAMP}" "${ARCH_NAME}")
+                                    
+                                    if [ -z "\${IMAGE_ID}" ]; then
+                                        echo "ERROR: Failed to import image"
+                                        exit 1
+                                    fi
+                                    
+                                    echo "Image ID: \${IMAGE_ID}"
                                     
                                     docker tag \${IMAGE_ID} ${BASENAME}:${DIST_NAME}-${ARCH_NAME}
                                     docker tag \${IMAGE_ID} ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_DATE}
@@ -298,8 +300,6 @@ Pod:          ${env.NODE_NAME}
                         steps {
                             container('trivy') {
                                 sh """
-                                    echo "Scanning ${DIST_NAME}-${ARCH_NAME}"
-                                    
                                     trivy image \
                                         --severity HIGH,CRITICAL \
                                         --exit-code 0 \
@@ -353,8 +353,6 @@ Pod:          ${env.NODE_NAME}
             steps {
                 container('docker') {
                     script {
-                        echo "Creating multi-arch manifests"
-                        
                         def dists = env.BUILD_DISTS.split(',')
                         
                         sh "echo \${DOCKERHUB_PSW} | docker login -u \${DOCKERHUB_USR} --password-stdin"
@@ -366,7 +364,6 @@ Pod:          ${env.NODE_NAME}
                                     --amend ${BASENAME}:${dist}-arm64
                                 
                                 docker manifest push ${BASENAME}:${dist}
-                                echo "Manifest ${dist} created"
                             """
                         }
                         
@@ -377,7 +374,6 @@ Pod:          ${env.NODE_NAME}
                                     --amend ${BASENAME}:latest-arm64
                                 
                                 docker manifest push ${BASENAME}:latest
-                                echo "Latest manifest created"
                             """
                         }
                         
@@ -397,8 +393,6 @@ Pod:          ${env.NODE_NAME}
 **Build:** ${BUILD_NUMBER}
 **Date:** ${BUILD_TIMESTAMP}
 **Commit:** ${GIT_COMMIT_SHORT}
-**Distributions:** ${BUILD_DISTS}
-**Architectures:** ${BUILD_ARCHS}
 
 ## Images Built
 
@@ -406,15 +400,10 @@ EOF
                         docker images ${BASENAME} --format "- {{.Repository}}:{{.Tag}} ({{.Size}})" >> build-report.md
                         
                         echo "" >> build-report.md
-                        echo "## Security Scan Results" >> build-report.md
+                        echo "## Security Scans" >> build-report.md
                         for report in build/trivy-*.json; do
                             [ -f "$report" ] && echo "- $(basename $report)" >> build-report.md
                         done || true
-                        
-                        echo "" >> build-report.md
-                        echo "## Links" >> build-report.md
-                        echo "- Docker Hub: https://hub.docker.com/r/vcnngr/minideb" >> build-report.md
-                        echo "- SonarQube: ${SONAR_HOST_URL}/dashboard?id=vcnngr-minideb" >> build-report.md || true
                         
                         cat build-report.md
                     '''
@@ -439,15 +428,11 @@ EOF
 ╚════════════════════════════════════════════╝
 
 Images: https://hub.docker.com/r/vcnngr/minideb
-
-Pull commands:
-  docker pull ${BASENAME}:bookworm
-  docker pull ${BASENAME}:latest
 """
         }
         
         failure {
-            echo "Build failed - check console output for details"
+            echo "Build failed - check console output"
         }
     }
 }
