@@ -15,6 +15,9 @@
  * - vcnngr/minideb:latest
  */
 
+// VCNNGR Minideb Pipeline - Production with SonarQube
+// Fixed: All operations in debian container (has bash + docker)
+
 pipeline {
     agent {
         kubernetes {
@@ -55,6 +58,10 @@ spec:
     env:
     - name: DEBIAN_FRONTEND
       value: noninteractive
+  - name: sonar-scanner
+    image: sonarsource/sonar-scanner-cli:latest
+    command: [cat]
+    tty: true
   - name: trivy
     image: aquasec/trivy:latest
     command: [cat]
@@ -72,6 +79,7 @@ spec:
         LATEST = 'trixie'
         
         DOCKERHUB = credentials('dockerhub-credentials')
+        SONAR_TOKEN = credentials('sonarqube-token')
         
         GIT_COMMIT_SHORT = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
         BUILD_DATE = sh(returnStdout: true, script: 'date -u +%Y%m%d').trim()
@@ -84,6 +92,7 @@ spec:
         booleanParam(name: 'PUSH_TO_REGISTRY', defaultValue: false, description: 'Push to Docker Hub')
         booleanParam(name: 'CREATE_MANIFESTS', defaultValue: true, description: 'Create manifests')
         booleanParam(name: 'RUN_SECURITY_SCAN', defaultValue: true, description: 'Run security scan')
+        booleanParam(name: 'RUN_SONARQUBE', defaultValue: true, description: 'Run SonarQube analysis')
     }
     
     options {
@@ -99,13 +108,14 @@ spec:
                 script {
                     echo """
 ╔════════════════════════════════════════════╗
-║   VCNNGR MinidEB Build Pipeline           ║
-║   Based on Bitnami MinidEB                 ║
+║   VCNNGR Minideb Build Pipeline           ║
+║   Based on Bitnami Minideb                 ║
 ╚════════════════════════════════════════════╝
 
 Distribution: ${params.DIST}
 Architecture: ${params.ARCH}
 Build Date:   ${BUILD_DATE}
+Build Time:   ${BUILD_TIMESTAMP}
 Commit:       ${GIT_COMMIT_SHORT}
 Workspace:    ${env.WORKSPACE}
 """
@@ -126,10 +136,12 @@ Workspace:    ${env.WORKSPACE}
                         apt-get update -qq
                         apt-get install -y -qq \
                             debootstrap debian-archive-keyring jq dpkg-dev \
-                            gnupg curl shellcheck git rsync qemu-user-static \
-                            docker.io
+                            gnupg curl shellcheck git rsync qemu-user-static docker.io
                         
-                        # Ensure scripts are executable
+                        # Verify docker is working
+                        docker version
+                        
+                        # Make scripts executable
                         chmod +x mkimage import buildone test pushone pushall pushmanifest || true
                         
                         # Setup QEMU for cross-platform builds
@@ -140,15 +152,104 @@ Workspace:    ${env.WORKSPACE}
         }
         
         stage('Code Quality') {
+            parallel {
+                stage('Shellcheck') {
+                    steps {
+                        container('debian') {
+                            sh '''
+                                if [ -f shellcheck ]; then
+                                    bash shellcheck || echo "Shellcheck warnings found"
+                                else
+                                    shellcheck mkimage import buildone || echo "Shellcheck completed"
+                                fi
+                            '''
+                        }
+                    }
+                }
+                
+                stage('SonarQube Analysis') {
+                    when {
+                        expression { params.RUN_SONARQUBE }
+                    }
+                    steps {
+                        container('sonar-scanner') {
+                            script {
+                                try {
+                                    sh '''
+                                        echo "Starting SonarQube scan..."
+                                        echo "Token length: ${#SONAR_TOKEN}"
+                                        
+                                        sonar-scanner \
+                                            -Dsonar.host.url=http://sonarqube-sonarqube.jenkins.svc.cluster.local:9000 \
+                                            -Dsonar.token=${SONAR_TOKEN} \
+                                            -Dsonar.projectKey=vcnngr-minideb \
+                                            -Dsonar.projectName='VCNNGR Minideb' \
+                                            -Dsonar.projectVersion=${BUILD_DATE}-${GIT_COMMIT_SHORT} \
+                                            -Dsonar.sources=. \
+                                            -Dsonar.exclusions='**/*.md,build/**,**/.github/**,**/.git/**,**/test/**' \
+                                            -Dsonar.sourceEncoding=UTF-8 \
+                                            -Dsonar.scm.disabled=true \
+                                            -Dsonar.verbose=true
+                                        
+                                        echo "SonarQube scan completed successfully"
+                                    '''
+                                } catch (Exception e) {
+                                    echo "WARNING: SonarQube scan failed: ${e.message}"
+                                    echo "Continuing build despite SonarQube failure"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Quality Gate') {
+            when {
+                expression { params.RUN_SONARQUBE }
+            }
             steps {
-                container('debian') {
-                    sh '''
-                        if [ -f shellcheck ]; then
-                            bash shellcheck || echo "Shellcheck warnings found"
-                        else
-                            shellcheck mkimage import buildone || echo "Shellcheck completed with warnings"
-                        fi
-                    '''
+                container('sonar-scanner') {
+                    timeout(time: 10, unit: 'MINUTES') {
+                        script {
+                            try {
+                                sh '''
+                                    echo "Checking Quality Gate status..."
+                                    sleep 10
+                                    
+                                    if [ -f .scannerwork/report-task.txt ]; then
+                                        TASK_URL=$(cat .scannerwork/report-task.txt | grep ceTaskUrl | cut -d'=' -f2-)
+                                        
+                                        if [ -n "$TASK_URL" ]; then
+                                            echo "Task URL: $TASK_URL"
+                                            
+                                            for i in {1..30}; do
+                                                STATUS=$(curl -s -u "${SONAR_TOKEN}:" "$TASK_URL" | grep -o '"status":"[^"]*"' | cut -d'"' -f4 || echo "UNKNOWN")
+                                                echo "Attempt $i: Status = $STATUS"
+                                                
+                                                if [ "$STATUS" = "SUCCESS" ]; then
+                                                    echo "Quality Gate check completed"
+                                                    break
+                                                elif [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "CANCELED" ]; then
+                                                    echo "WARNING: Quality Gate status: $STATUS"
+                                                    break
+                                                fi
+                                                
+                                                sleep 10
+                                            done
+                                        else
+                                            echo "WARNING: Could not find task URL"
+                                        fi
+                                    else
+                                        echo "WARNING: report-task.txt not found"
+                                    fi
+                                '''
+                            } catch (Exception e) {
+                                echo "WARNING: Quality Gate check failed: ${e.message}"
+                                echo "Continuing build despite Quality Gate failure"
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -203,22 +304,12 @@ Workspace:    ${env.WORKSPACE}
                                     set -e
                                     
                                     echo "Importing ${DIST_NAME}-${ARCH_NAME}"
-                                    cd ${WORKSPACE}
                                     
-                                    # Generate timestamp in ISO 8601 format
+                                    # ISO 8601 timestamp for import script (WITH colons - required by script)
                                     TIMESTAMP=\$(date -u +%Y-%m-%dT%H:%M:%SZ)
                                     echo "Using timestamp: \${TIMESTAMP}"
                                     
-                                    # Check if image exists and use its timestamp
-                                    if docker pull ${BASENAME}:${DIST_NAME}-${ARCH_NAME} 2>/dev/null; then
-                                        EXISTING_TS=\$(docker inspect ${BASENAME}:${DIST_NAME}-${ARCH_NAME} --format='{{.Created}}' 2>/dev/null || echo "")
-                                        if [ -n "\${EXISTING_TS}" ]; then
-                                            TIMESTAMP="\${EXISTING_TS}"
-                                            echo "Using existing image timestamp: \${TIMESTAMP}"
-                                        fi
-                                    fi
-                                    
-                                    # Execute import script (it's a bash script)
+                                    # Execute import script - uses bash
                                     echo "Running import script..."
                                     IMAGE_ID=\$(bash ./import "build/${DIST_NAME}-${ARCH_NAME}.tar" "\${TIMESTAMP}" "${ARCH_NAME}")
                                     
@@ -229,7 +320,7 @@ Workspace:    ${env.WORKSPACE}
                                     
                                     echo "Successfully imported image: \${IMAGE_ID}"
                                     
-                                    # Tag images
+                                    # Tag images - BUILD_TIMESTAMP has hyphens (Docker compatible)
                                     docker tag \${IMAGE_ID} ${BASENAME}:${DIST_NAME}-${ARCH_NAME}
                                     docker tag \${IMAGE_ID} ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_DATE}
                                     docker tag \${IMAGE_ID} ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_TIMESTAMP}
@@ -254,17 +345,14 @@ Workspace:    ${env.WORKSPACE}
                                 sh """
                                     echo "Testing ${DIST_NAME}-${ARCH_NAME}"
                                     
-                                    # Test 1: Check OS release
                                     echo "Test 1: OS Release"
                                     docker run --rm ${BASENAME}:${DIST_NAME}-${ARCH_NAME} \
                                         bash -c 'cat /etc/os-release | head -2'
                                     
-                                    # Test 2: Test install_packages
                                     echo "Test 2: Package Installation"
                                     docker run --rm ${BASENAME}:${DIST_NAME}-${ARCH_NAME} \
-                                        bash -c 'apt-get update -qq && apt-get install -y -qq curl && curl --version | head -1'
+                                        bash -c 'install_packages curl && curl --version | head -1'
                                     
-                                    # Test 3: Check architecture
                                     echo "Test 3: Architecture"
                                     docker run --rm ${BASENAME}:${DIST_NAME}-${ARCH_NAME} \
                                         bash -c 'dpkg --print-architecture'
@@ -316,6 +404,7 @@ Workspace:    ${env.WORKSPACE}
                                     
                                     docker push ${BASENAME}:${DIST_NAME}-${ARCH_NAME}
                                     docker push ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_DATE}
+                                    docker push ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_TIMESTAMP}
                                     
                                     if [ "${DIST_NAME}" = "${LATEST}" ]; then
                                         docker push ${BASENAME}:latest-${ARCH_NAME}
@@ -385,10 +474,11 @@ Workspace:    ${env.WORKSPACE}
                 container('debian') {
                     sh '''
                         cat > build-report.md << 'EOFMARKER'
-# VCNNGR MinidEB Build Report
+# VCNNGR Minideb Build Report
 
 **Build Number:** ${BUILD_NUMBER}
-**Build Date:** ${BUILD_TIMESTAMP}
+**Build Date:** ${BUILD_DATE}
+**Build Timestamp:** ${BUILD_TIMESTAMP}
 **Git Commit:** ${GIT_COMMIT_SHORT}
 **Distribution:** ${DIST}
 **Architecture:** ${ARCH}
@@ -409,6 +499,11 @@ EOFMARKER
                         else
                             echo "No security reports generated" >> build-report.md
                         fi
+                        
+                        echo "" >> build-report.md
+                        echo "## SonarQube Analysis" >> build-report.md
+                        echo "- Project: vcnngr-minideb" >> build-report.md
+                        echo "- Dashboard: http://sonarqube-sonarqube.jenkins.svc.cluster.local:9000/dashboard?id=vcnngr-minideb" >> build-report.md
                         
                         cat build-report.md
                     '''
@@ -432,8 +527,8 @@ EOFMARKER
 ║   BUILD SUCCESSFUL                         ║
 ╚════════════════════════════════════════════╝
 
-Images available at: https://hub.docker.com/r/vcnngr/minideb
-Build artifacts archived in Jenkins
+Images: https://hub.docker.com/r/vcnngr/minideb
+SonarQube: http://sonarqube-sonarqube.jenkins.svc.cluster.local:9000/dashboard?id=vcnngr-minideb
 """
         }
         

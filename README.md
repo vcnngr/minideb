@@ -1,10 +1,10 @@
-# VCNNGR MinidEB
+# VCNNGR Minideb
 
-**Based on Bitnami MinidEB** - A minimalist Debian-based image for containers.
+**Based on Bitnami Minideb** - A minimalist Debian-based image for containers.
 
 ## Attribution & License
 
-This project is a fork of [Bitnami MinidEB](https://github.com/bitnami/minideb) maintaining full attribution to the original work.
+This project is a fork of [Bitnami Minideb](https://github.com/bitnami/minideb) maintaining full attribution to the original work.
 
 **Original Copyright:** Copyright 2016-2024 Broadcom. All Rights Reserved.  
 **License:** Apache License 2.0
