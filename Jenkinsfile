@@ -369,24 +369,57 @@ Workspace:    ${env.WORKSPACE}
                         }
                         steps {
                             container('trivy') {
-                                sh """
-                                    mkdir -p build/security
+                                script {
+                                    sh "mkdir -p build/security"
                                     
                                     echo "Running security scan for ${DIST_NAME}-${ARCH_NAME}"
                                     
-                                    trivy image \
-                                        --severity HIGH,CRITICAL \
-                                        --exit-code 0 \
-                                        --timeout 10m \
-                                        ${BASENAME}:${DIST_NAME}-${ARCH_NAME}
+                                    // Retry con pulizia cache in caso di errore
+                                    def maxRetries = 3
+                                    def success = false
                                     
-                                    trivy image \
-                                        --format json \
-                                        --output build/security/trivy-${DIST_NAME}-${ARCH_NAME}.json \
-                                        ${BASENAME}:${DIST_NAME}-${ARCH_NAME} || true
+                                    for (int attempt = 1; attempt <= maxRetries; attempt++) {
+                                        try {
+                                            if (attempt > 1) {
+                                                echo "Retry attempt ${attempt}/${maxRetries} - Cleaning Trivy cache..."
+                                                sh "trivy clean --all || true"
+                                                sleep(time: 5, unit: 'SECONDS')
+                                            }
+                                            
+                                            sh """
+                                                trivy image \
+                                                    --severity HIGH,CRITICAL \
+                                                    --exit-code 0 \
+                                                    --timeout 10m \
+                                                    ${BASENAME}:${DIST_NAME}-${ARCH_NAME}
+                                            """
+                                            
+                                            success = true
+                                            break
+                                            
+                                        } catch (Exception e) {
+                                            echo "WARNING: Trivy scan attempt ${attempt} failed: ${e.message}"
+                                            if (attempt == maxRetries) {
+                                                echo "ERROR: All ${maxRetries} attempts failed"
+                                                throw e
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Genera report JSON (sempre, anche se scan fallisce)
+                                    try {
+                                        sh """
+                                            trivy image \
+                                                --format json \
+                                                --output build/security/trivy-${DIST_NAME}-${ARCH_NAME}.json \
+                                                ${BASENAME}:${DIST_NAME}-${ARCH_NAME} || true
+                                        """
+                                    } catch (Exception e) {
+                                        echo "WARNING: Failed to generate JSON report: ${e.message}"
+                                    }
                                     
                                     echo "Security scan completed"
-                                """
+                                }
                             }
                         }
                     }
