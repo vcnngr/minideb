@@ -1,5 +1,19 @@
-// VCNNGR MinidEB Pipeline - Production Ready
-// Optimized for actual import script behavior
+#!/usr/bin/env groovy
+/**
+ * VCNNGR Minideb Pipeline
+ * 
+ * Build base image Debian minimal con ultime patch di sicurezza
+ * 
+ * Trigger: 
+ * - Manual
+ * - Scheduled (weekly)
+ * - Webhook da Debian security announce
+ * 
+ * Output:
+ * - vcnngr/minideb:bookworm
+ * - vcnngr/minideb:12
+ * - vcnngr/minideb:latest
+ */
 
 pipeline {
     agent {
@@ -61,7 +75,7 @@ spec:
         
         GIT_COMMIT_SHORT = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
         BUILD_DATE = sh(returnStdout: true, script: 'date -u +%Y%m%d').trim()
-        BUILD_TIMESTAMP = sh(returnStdout: true, script: 'date -u +%Y-%m-%dT%H:%M:%SZ').trim()
+        BUILD_TIMESTAMP = sh(returnStdout: true, script: 'date -u +%Y-%m-%dT%H-%M-%S').trim()
     }
     
     parameters {
