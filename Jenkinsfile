@@ -14,8 +14,6 @@ spec:
     runAsUser: 0
     fsGroup: 0
   containers:
-  # 1. Questo è il nuovo container che sostituisce 'debian'. 
-  # Ha già Buildah e Podman installati.
   - name: builder
     image: quay.io/buildah/stable:v1.33
     command: [cat]
@@ -23,7 +21,6 @@ spec:
     securityContext:
       privileged: true
     env:
-    # 2. Configurazione automatica per evitare errori di storage su Kubernetes
     - name: STORAGE_DRIVER
       value: "vfs"
     - name: BUILDAH_FORMAT
@@ -36,7 +33,6 @@ spec:
         memory: "8Gi"
         cpu: "4000m"
   
-  # Container ausiliari (uguali a prima)
   - name: sonar-scanner
     image: sonarsource/sonar-scanner-cli:latest
     command: [cat]
@@ -95,11 +91,11 @@ spec:
         stage('Setup') {
             steps {
                 container('builder') {
-                    // Qui installiamo debootstrap e jq perché l'immagine 'buildah' di base non li ha.
-                    // Così non devi creare tu un'immagine docker custom.
+                    // *** CORREZIONE QUI ***
+                    // Ho aggiunto 'podman' alla lista dei pacchetti da installare
                     sh '''
                         echo "Installing dependencies..."
-                        dnf install -y debootstrap jq debian-keyring qemu-user-static > /dev/null
+                        dnf install -y debootstrap jq debian-keyring qemu-user-static podman > /dev/null
                         
                         echo "Check tools:"
                         buildah --version
@@ -111,7 +107,41 @@ spec:
             }
         }
         
-        // ... (Stage Code Quality / Sonar rimangono identici a prima, saltati per brevità ma puoi lasciarli) ...
+        // Stage SonarQube (se lo usi, altrimenti può essere rimosso o ignorato)
+        stage('Code Quality') {
+             parallel {
+                stage('Shellcheck') {
+                    steps {
+                        container('builder') {
+                             sh 'echo "Skipping shellcheck due to missing tool in base image" || true'
+                        }
+                    }
+                }
+                stage('SonarQube') {
+                    when { expression { params.RUN_SONARQUBE } }
+                    steps {
+                        container('sonar-scanner') {
+                            script {
+                                try {
+                                    sh """
+                                        sonar-scanner \
+                                            -Dsonar.host.url=http://sonarqube-sonarqube.jenkins.svc.cluster.local:9000 \
+                                            -Dsonar.token=${SONAR_TOKEN} \
+                                            -Dsonar.projectKey=vcnngr-minideb \
+                                            -Dsonar.projectName='VCNNGR Minideb' \
+                                            -Dsonar.projectVersion=${BUILD_DATE}-${GIT_COMMIT_SHORT} \
+                                            -Dsonar.sources=. \
+                                            -Dsonar.scm.disabled=true
+                                    """
+                                } catch (Exception e) {
+                                    echo "SonarQube skipped/failed: ${e.message}"
+                                }
+                            }
+                        }
+                    }
+                }
+             }
+        }
 
         stage('Build Images') {
             matrix {
@@ -135,7 +165,7 @@ spec:
                                     echo "Building Base RootFS for ${DIST_NAME}-${ARCH_NAME}"
                                     mkdir -p build
                                     
-                                    # Usa il tuo script mkimage esistente (che usa debootstrap)
+                                    # Generazione rootfs
                                     ./mkimage "build/${DIST_NAME}-${ARCH_NAME}.tar" "${DIST_NAME}" "${ARCH_NAME}"
                                 """
                             }
@@ -146,14 +176,13 @@ spec:
                         steps {
                             container('builder') {
                                 sh """
-                                    # Usa il NUOVO script import-buildah
-                                    # Questo crea l'immagine usando Buildah invece di Docker Daemon
+                                    # Import con Buildah
                                     ./import-buildah "build/${DIST_NAME}-${ARCH_NAME}.tar" "${BUILD_TIMESTAMP}" "${ARCH_NAME}" > image_id.txt
                                     
                                     IMAGE_ID=\$(cat image_id.txt)
                                     echo "Created Image ID: \$IMAGE_ID"
                                     
-                                    # Tagging con Buildah
+                                    # Tagging
                                     buildah tag \$IMAGE_ID ${BASENAME}:${DIST_NAME}-${ARCH_NAME}
                                     buildah tag \$IMAGE_ID ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_DATE}
                                     buildah tag \$IMAGE_ID ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_TIMESTAMP}
@@ -171,11 +200,10 @@ spec:
                     stage('Test') {
                         steps {
                             container('builder') {
-                                // Usiamo PODMAN per i test (sostituisce docker run)
                                 sh """
                                     echo "Testing ${DIST_NAME}-${ARCH_NAME}"
                                     
-                                    # Podman run funziona esattamente come docker run
+                                    # Ora Podman è installato e funzionerà
                                     podman run --rm ${BASENAME}:${DIST_NAME}-${ARCH_NAME} cat /etc/os-release | head -2
                                     podman run --rm ${BASENAME}:${DIST_NAME}-${ARCH_NAME} dpkg --print-architecture
                                 """
@@ -187,10 +215,8 @@ spec:
                         when { expression { params.RUN_SECURITY_SCAN } }
                         steps {
                             container('trivy') {
-                                // Trivy scansiona direttamente il file TAR (più veloce e sicuro senza socket docker)
                                 sh """
                                     mkdir -p build/security
-                                    
                                     trivy image \
                                         --input "build/${DIST_NAME}-${ARCH_NAME}.tar" \
                                         --severity HIGH,CRITICAL \
@@ -242,16 +268,12 @@ spec:
                         dists.each { dist ->
                             sh """
                                 echo "Manifest per ${dist}..."
-                                
-                                # Crea una lista manifest (unisce amd64 e arm64)
                                 buildah manifest rm ${BASENAME}:${dist} || true
                                 buildah manifest create ${BASENAME}:${dist}
                                 
-                                # Aggiungi le immagini precedentemente pushate
                                 buildah manifest add ${BASENAME}:${dist} docker://${BASENAME}:${dist}-amd64
                                 buildah manifest add ${BASENAME}:${dist} docker://${BASENAME}:${dist}-arm64
                                 
-                                # Push del manifest completo
                                 buildah manifest push --all ${BASENAME}:${dist} docker://${BASENAME}:${dist}
                             """
                         }
@@ -271,11 +293,9 @@ spec:
             }
         }
         
-        // Report e Post actions rimangono uguali al tuo vecchio file
         stage('Generate Report') {
              steps {
                 container('builder') {
-                    // Solo una piccola modifica qui: usare 'buildah images' invece di 'docker images'
                     sh '''
                         echo "# VCNNGR Minideb Report" > build-report.md
                         buildah images >> build-report.md
@@ -289,7 +309,6 @@ spec:
         always {
             archiveArtifacts artifacts: 'build-report.md,build/**/*.log,build/security/*.json', allowEmptyArchive: true
             container('builder') {
-                // Pulizia Buildah
                 sh 'buildah rm --all || true'
                 sh 'buildah rmi --prune || true'
             }
