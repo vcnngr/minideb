@@ -13,6 +13,19 @@ spec:
   securityContext:
     runAsUser: 0
     fsGroup: 0
+  # -----------------------------------------------------------
+  # NUOVA SEZIONE: InitContainer
+  # Questo esegue la registrazione QEMU a livello di Pod/Nodo
+  # PRIMA che parta la build. È il metodo più robusto.
+  # -----------------------------------------------------------
+  initContainers:
+  - name: register-qemu
+    image: multiarch/qemu-user-static
+    # Il flag -p yes è cruciale: rende la registrazione persistente
+    args: ["--reset", "-p", "yes"]
+    securityContext:
+      privileged: true
+  
   containers:
   - name: builder
     image: quay.io/buildah/stable:v1.33
@@ -55,8 +68,7 @@ spec:
         
         GIT_COMMIT_SHORT = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
         BUILD_DATE = sh(returnStdout: true, script: 'date -u +%Y%m%d').trim()
-        // TIMESTAMP ISO 8601 (Cruciale per la riproducibilità con Buildah)
-        BUILD_TIMESTAMP = sh(returnStdout: true, script: 'date -u +%Y-%m-%dT%H:%M:%SZ').trim()
+        BUILD_TIMESTAMP = sh(returnStdout: true, script: 'date -u +%Y-%m-%dT%H-%M-%S').trim()
     }
     
     parameters {
@@ -92,20 +104,23 @@ spec:
         stage('Setup') {
             steps {
                 container('builder') {
-                    // *** FIX PER ARM64 ***
-                    // 1. Installiamo le dipendenze (podman incluso)
-                    // 2. Usiamo Podman per registrare QEMU nel kernel dell'host
+                    // *** SETUP SEMPLIFICATO ***
+                    // Non serve più 'podman run' qui perché lo fa l'InitContainer.
+                    // Installiamo solo i binari fisici che 'mkimage' copierà dentro il rootfs.
                     sh '''
                         echo "Installing dependencies..."
                         dnf install -y debootstrap jq debian-keyring qemu-user-static podman git > /dev/null
                         
-                        echo "Registering QEMU binaries for cross-compilation..."
-                        # Questo comando risolve l'errore "Exec format error"
-                        podman run --rm --privileged multiarch/qemu-user-static --reset -p yes || echo "WARNING: QEMU registration might have failed, hoping host is already configured"
-                        
                         echo "Check tools:"
                         buildah --version
                         podman --version
+                        
+                        # Verifica se l'InitContainer ha funzionato (opzionale, solo debug)
+                        if [ -f /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+                            echo "SUCCESS: QEMU aarch64 is registered in kernel!"
+                        else
+                            echo "WARNING: QEMU aarch64 NOT found in binfmt_misc. Build might fail."
+                        fi
                         
                         chmod +x mkimage import-buildah
                     '''
@@ -113,6 +128,7 @@ spec:
             }
         }
         
+        // ... Stages Code Quality (SonarQube) rimangono uguali ...
         stage('Code Quality') {
              parallel {
                 stage('Shellcheck') {
@@ -171,7 +187,7 @@ spec:
                                     mkdir -p build
                                     
                                     # Generazione rootfs
-                                    # Grazie al fix QEMU nel Setup, questo ora funzionerà anche per ARM64
+                                    # L'InitContainer ha preparato il kernel, quindi chroot funzionerà
                                     ./mkimage "build/${DIST_NAME}-${ARCH_NAME}.tar" "${DIST_NAME}" "${ARCH_NAME}"
                                 """
                             }
@@ -182,7 +198,7 @@ spec:
                         steps {
                             container('builder') {
                                 sh """
-                                    # Import con Buildah (usa import-buildah)
+                                    # Import con Buildah
                                     ./import-buildah "build/${DIST_NAME}-${ARCH_NAME}.tar" "${BUILD_TIMESTAMP}" "${ARCH_NAME}" > image_id.txt
                                     
                                     IMAGE_ID=\$(cat image_id.txt)
@@ -208,8 +224,6 @@ spec:
                             container('builder') {
                                 sh """
                                     echo "Testing ${DIST_NAME}-${ARCH_NAME}"
-                                    
-                                    # Podman run userà QEMU automaticamente
                                     podman run --rm ${BASENAME}:${DIST_NAME}-${ARCH_NAME} cat /etc/os-release | head -2
                                     podman run --rm ${BASENAME}:${DIST_NAME}-${ARCH_NAME} dpkg --print-architecture
                                 """
