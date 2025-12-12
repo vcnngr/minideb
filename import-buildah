@@ -1,0 +1,61 @@
+#!/bin/bash
+
+# Import a tarball as a container image using Buildah.
+# Matches the functionality of the old Docker-based import script
+# ensuring metadata parity and reproducibility via timestamps.
+
+set -e
+set -u
+set -o pipefail
+
+SOURCE=${1:?Specify the tarball to import}
+TIMESTAMP=${2:?Specify the timestamp to use}
+PLATFORM=${3:?Specify the target platform}
+
+# Verifica esistenza file
+if [ ! -f "$SOURCE" ]; then
+    echo "ERROR: Tarball not found: $SOURCE" >&2
+    exit 1
+fi
+
+# 1. Crea contenitore temporaneo da zero (equivalente al vecchio JSON vuoto)
+CTR=$(buildah from scratch)
+
+# 2. Copia il contenuto del tar (equivalente a cp layer.tar)
+# Aggiunge il contenuto alla root '/' del container
+buildah add "$CTR" "$SOURCE" /
+
+# 3. Configura i metadati per rispecchiare ESATTAMENTE il vecchio template JSON
+#
+# Vecchio JSON Template Mappings:
+# "architecture" -> --arch "$PLATFORM"
+# "os"           -> --os "linux"
+# "Cmd"          -> --cmd "/bin/bash"
+# "comment"      -> --comment "Based on Bitnami MinidEB - VCNNGR"
+#
+# Nota: Buildah gestisce "created" automaticamente tramite il flag --timestamp nel commit
+buildah config \
+    --arch "$PLATFORM" \
+    --os "linux" \
+    --cmd "/bin/bash" \
+    --comment "Based on Bitnami MinidEB - VCNNGR" \
+    "$CTR"
+
+# 4. Commit con Timestamp forzato per riproducibilità
+# --timestamp: Sostituisce la manipolazione manuale del campo "created" nel JSON
+# --format docker: Mantiene la compatibilità col formato schema V2 usato prima
+# --omit-history: Opzionale, ma aiuta a rendere l'output più pulito simile al vecchio import
+# 
+# Nota: L'hash finale (Image ID) sarà diverso dal vecchio sistema perché 
+# il campo "generator" sarà Buildah e non Docker 1.13.0, ma i contenuti e
+# la riproducibilità (stesso timestamp = stesso hash) sono garantiti.
+IMAGE_ID=$(buildah commit \
+    --timestamp "$TIMESTAMP" \
+    --format docker \
+    "$CTR" 2>&1 | tail -n 1)
+
+# 5. Pulizia
+buildah rm "$CTR" > /dev/null
+
+# Output dell'ID (come richiesto dalla pipeline)
+echo "$IMAGE_ID"
