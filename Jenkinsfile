@@ -13,22 +13,19 @@ spec:
   securityContext:
     runAsUser: 0
     fsGroup: 0
-  # -----------------------------------------------------------
-  # NUOVA SEZIONE: InitContainer
-  # Questo esegue la registrazione QEMU a livello di Pod/Nodo
-  # PRIMA che parta la build. È il metodo più robusto.
-  # -----------------------------------------------------------
+  
+  # InitContainer per registrare QEMU (necessario per ARM64)
   initContainers:
   - name: register-qemu
     image: multiarch/qemu-user-static
-    # Il flag -p yes è cruciale: rende la registrazione persistente
     args: ["--reset", "-p", "yes"]
     securityContext:
       privileged: true
-  
+
   containers:
+  # USIAMO DEBIAN COME AGENT
   - name: builder
-    image: quay.io/buildah/stable:v1.33
+    image: debian:bookworm
     command: [cat]
     tty: true
     securityContext:
@@ -91,7 +88,7 @@ spec:
         stage('Initialize') {
             steps {
                 script {
-                    echo "--- VCNNGR Minideb Build (Buildah Edition) ---"
+                    echo "--- VCNNGR Minideb Build (Buildah on Debian) ---"
                     def dists = params.DIST == 'all' ? ['bullseye', 'bookworm', 'trixie'] : [params.DIST]
                     def archs = params.ARCH == 'all' ? ['amd64', 'arm64'] : [params.ARCH]
                     
@@ -104,23 +101,26 @@ spec:
         stage('Setup') {
             steps {
                 container('builder') {
-                    // *** SETUP SEMPLIFICATO ***
-                    // Non serve più 'podman run' qui perché lo fa l'InitContainer.
-                    // Installiamo solo i binari fisici che 'mkimage' copierà dentro il rootfs.
+                    // *** SETUP DEBIAN ***
+                    // Qui usiamo apt-get.
+                    // buildah e podman sono nei repo ufficiali di Bookworm.
+                    // dpkg-dev contiene dpkg-parsechangelog che serviva a mkimage.
                     sh '''
-                        echo "Installing dependencies..."
-                        dnf install -y debootstrap jq debian-keyring qemu-user-static podman git > /dev/null
+                        apt-get update -qq
+                        apt-get install -y -qq \
+                            buildah \
+                            podman \
+                            qemu-user-static \
+                            debootstrap \
+                            jq \
+                            curl \
+                            git \
+                            dpkg-dev \
+                            debian-archive-keyring
                         
                         echo "Check tools:"
                         buildah --version
                         podman --version
-                        
-                        # Verifica se l'InitContainer ha funzionato (opzionale, solo debug)
-                        if [ -f /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
-                            echo "SUCCESS: QEMU aarch64 is registered in kernel!"
-                        else
-                            echo "WARNING: QEMU aarch64 NOT found in binfmt_misc. Build might fail."
-                        fi
                         
                         chmod +x mkimage import-buildah
                     '''
@@ -128,12 +128,12 @@ spec:
             }
         }
         
-        // ... Stages Code Quality (SonarQube) rimangono uguali ...
         stage('Code Quality') {
              parallel {
                 stage('Shellcheck') {
                     steps {
                         container('builder') {
+                             // Possiamo installare shellcheck se serve: apt-get install shellcheck
                              sh 'echo "Skipping shellcheck" || true'
                         }
                     }
@@ -185,9 +185,6 @@ spec:
                                 sh """
                                     echo "Building Base RootFS for ${DIST_NAME}-${ARCH_NAME}"
                                     mkdir -p build
-                                    
-                                    # Generazione rootfs
-                                    # L'InitContainer ha preparato il kernel, quindi chroot funzionerà
                                     ./mkimage "build/${DIST_NAME}-${ARCH_NAME}.tar" "${DIST_NAME}" "${ARCH_NAME}"
                                 """
                             }
@@ -198,13 +195,11 @@ spec:
                         steps {
                             container('builder') {
                                 sh """
-                                    # Import con Buildah
                                     ./import-buildah "build/${DIST_NAME}-${ARCH_NAME}.tar" "${BUILD_TIMESTAMP}" "${ARCH_NAME}" > image_id.txt
                                     
                                     IMAGE_ID=\$(cat image_id.txt)
                                     echo "Created Image ID: \$IMAGE_ID"
                                     
-                                    # Tagging
                                     buildah tag \$IMAGE_ID ${BASENAME}:${DIST_NAME}-${ARCH_NAME}
                                     buildah tag \$IMAGE_ID ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_DATE}
                                     buildah tag \$IMAGE_ID ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_TIMESTAMP}
