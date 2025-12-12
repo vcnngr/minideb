@@ -14,7 +14,7 @@ spec:
     runAsUser: 0
     fsGroup: 0
   
-  # InitContainer per registrare QEMU (necessario per ARM64)
+  # InitContainer: Registra QEMU nel Kernel dell'host (Fix per ARM64)
   initContainers:
   - name: register-qemu
     image: multiarch/qemu-user-static
@@ -23,7 +23,6 @@ spec:
       privileged: true
 
   containers:
-  # USIAMO DEBIAN COME AGENT
   - name: builder
     image: debian:bookworm
     command: [cat]
@@ -35,13 +34,14 @@ spec:
       value: "vfs"
     - name: BUILDAH_FORMAT
       value: "docker"
+    # Risorse aumentate per gestire l'emulazione QEMU senza stalli
     resources:
       requests:
         memory: "4Gi"
         cpu: "2000m"
       limits:
         memory: "8Gi"
-        cpu: "4000m"
+        cpu: "6000m"
   
   - name: sonar-scanner
     image: sonarsource/sonar-scanner-cli:latest
@@ -60,6 +60,7 @@ spec:
         DOCKER_REGISTRY = 'docker.io'
         LATEST = 'trixie'
         
+        // Credenziali caricate come variabili d'ambiente
         DOCKERHUB = credentials('dockerhub-credentials')
         SONAR_TOKEN = credentials('sonarqube-token')
         
@@ -88,7 +89,7 @@ spec:
         stage('Initialize') {
             steps {
                 script {
-                    echo "--- VCNNGR Minideb Build (Buildah on Debian) ---"
+                    echo "--- VCNNGR Minideb Build (Secure & Sequential) ---"
                     def dists = params.DIST == 'all' ? ['bullseye', 'bookworm', 'trixie'] : [params.DIST]
                     def archs = params.ARCH == 'all' ? ['amd64', 'arm64'] : [params.ARCH]
                     
@@ -101,10 +102,7 @@ spec:
         stage('Setup') {
             steps {
                 container('builder') {
-                    // *** SETUP DEBIAN ***
-                    // Qui usiamo apt-get.
-                    // buildah e podman sono nei repo ufficiali di Bookworm.
-                    // dpkg-dev contiene dpkg-parsechangelog che serviva a mkimage.
+                    // Installazione tool su Debian Bookworm
                     sh '''
                         apt-get update -qq
                         apt-get install -y -qq \
@@ -116,11 +114,18 @@ spec:
                             curl \
                             git \
                             dpkg-dev \
+                            perl \
                             debian-archive-keyring
                         
                         echo "Check tools:"
                         buildah --version
                         podman --version
+                        
+                        if [ ! -f /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+                            echo "WARNING: QEMU not found in /proc. ARM builds might fail!"
+                        else
+                            echo "QEMU aarch64 is active."
+                        fi
                         
                         chmod +x mkimage import-buildah
                     '''
@@ -133,7 +138,6 @@ spec:
                 stage('Shellcheck') {
                     steps {
                         container('builder') {
-                             // Possiamo installare shellcheck se serve: apt-get install shellcheck
                              sh 'echo "Skipping shellcheck" || true'
                         }
                     }
@@ -144,10 +148,12 @@ spec:
                         container('sonar-scanner') {
                             script {
                                 try {
+                                    // SECURITY FIX: Usiamo \$SONAR_TOKEN invece di ${SONAR_TOKEN}
+                                    // Così è la shell a leggere la variabile, non Groovy a interpolarla.
                                     sh """
                                         sonar-scanner \
                                             -Dsonar.host.url=http://sonarqube-sonarqube.jenkins.svc.cluster.local:9000 \
-                                            -Dsonar.token=${SONAR_TOKEN} \
+                                            -Dsonar.token=\$SONAR_TOKEN \
                                             -Dsonar.projectKey=vcnngr-minideb \
                                             -Dsonar.projectName='VCNNGR Minideb' \
                                             -Dsonar.projectVersion=${BUILD_DATE}-${GIT_COMMIT_SHORT} \
@@ -179,85 +185,95 @@ spec:
                 }
                 
                 stages {
-                    stage('Create Base') {
-                        steps {
-                            container('builder') {
-                                sh """
-                                    echo "Building Base RootFS for ${DIST_NAME}-${ARCH_NAME}"
-                                    mkdir -p build
-                                    ./mkimage "build/${DIST_NAME}-${ARCH_NAME}.tar" "${DIST_NAME}" "${ARCH_NAME}"
-                                """
-                            }
+                    stage('Build Sequence') {
+                        // CONCURRENCY FIX: Il lock forza l'esecuzione sequenziale.
+                        // Evita che 6 istanze di QEMU soffochino la CPU del nodo.
+                        options {
+                            lock(resource: 'vcnngr-build-cpu', inversePrecedence: true) 
                         }
-                    }
-                    
-                    stage('Import & Tag') {
-                        steps {
-                            container('builder') {
-                                sh """
-                                    ./import-buildah "build/${DIST_NAME}-${ARCH_NAME}.tar" "${BUILD_TIMESTAMP}" "${ARCH_NAME}" > image_id.txt
-                                    
-                                    IMAGE_ID=\$(cat image_id.txt)
-                                    echo "Created Image ID: \$IMAGE_ID"
-                                    
-                                    buildah tag \$IMAGE_ID ${BASENAME}:${DIST_NAME}-${ARCH_NAME}
-                                    buildah tag \$IMAGE_ID ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_DATE}
-                                    buildah tag \$IMAGE_ID ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_TIMESTAMP}
-                                    
-                                    if [ "${DIST_NAME}" = "${LATEST}" ]; then
-                                        buildah tag \$IMAGE_ID ${BASENAME}:latest-${ARCH_NAME}
-                                    fi
-                                    
-                                    buildah images
-                                """
+                        stages {
+                            stage('Create Base') {
+                                steps {
+                                    container('builder') {
+                                        sh """
+                                            echo "Building Base RootFS for ${DIST_NAME}-${ARCH_NAME}"
+                                            mkdir -p build
+                                            ./mkimage "build/${DIST_NAME}-${ARCH_NAME}.tar" "${DIST_NAME}" "${ARCH_NAME}"
+                                        """
+                                    }
+                                }
                             }
-                        }
-                    }
-                    
-                    stage('Test') {
-                        steps {
-                            container('builder') {
-                                sh """
-                                    echo "Testing ${DIST_NAME}-${ARCH_NAME}"
-                                    podman run --rm ${BASENAME}:${DIST_NAME}-${ARCH_NAME} cat /etc/os-release | head -2
-                                    podman run --rm ${BASENAME}:${DIST_NAME}-${ARCH_NAME} dpkg --print-architecture
-                                """
+                            
+                            stage('Import & Tag') {
+                                steps {
+                                    container('builder') {
+                                        sh """
+                                            ./import-buildah "build/${DIST_NAME}-${ARCH_NAME}.tar" "${BUILD_TIMESTAMP}" "${ARCH_NAME}" > image_id.txt
+                                            
+                                            IMAGE_ID=\$(cat image_id.txt)
+                                            echo "Created Image ID: \$IMAGE_ID"
+                                            
+                                            buildah tag \$IMAGE_ID ${BASENAME}:${DIST_NAME}-${ARCH_NAME}
+                                            buildah tag \$IMAGE_ID ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_DATE}
+                                            buildah tag \$IMAGE_ID ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_TIMESTAMP}
+                                            
+                                            if [ "${DIST_NAME}" = "${LATEST}" ]; then
+                                                buildah tag \$IMAGE_ID ${BASENAME}:latest-${ARCH_NAME}
+                                            fi
+                                            
+                                            buildah images
+                                        """
+                                    }
+                                }
                             }
-                        }
-                    }
-                    
-                    stage('Security') {
-                        when { expression { params.RUN_SECURITY_SCAN } }
-                        steps {
-                            container('trivy') {
-                                sh """
-                                    mkdir -p build/security
-                                    trivy image \
-                                        --input "build/${DIST_NAME}-${ARCH_NAME}.tar" \
-                                        --severity HIGH,CRITICAL \
-                                        --format json \
-                                        --output build/security/trivy-${DIST_NAME}-${ARCH_NAME}.json || true
-                                """
+                            
+                            stage('Test') {
+                                steps {
+                                    container('builder') {
+                                        sh """
+                                            echo "Testing ${DIST_NAME}-${ARCH_NAME}"
+                                            podman run --rm ${BASENAME}:${DIST_NAME}-${ARCH_NAME} cat /etc/os-release | head -2
+                                            podman run --rm ${BASENAME}:${DIST_NAME}-${ARCH_NAME} dpkg --print-architecture
+                                        """
+                                    }
+                                }
                             }
-                        }
-                    }
-                    
-                    stage('Push') {
-                        when { expression { params.PUSH_TO_REGISTRY } }
-                        steps {
-                            container('builder') {
-                                sh """
-                                    echo "Pushing..."
-                                    echo \${DOCKERHUB_PSW} | buildah login -u \${DOCKERHUB_USR} --password-stdin ${DOCKER_REGISTRY}
-                                    
-                                    buildah push ${BASENAME}:${DIST_NAME}-${ARCH_NAME}
-                                    buildah push ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_DATE}
-                                    buildah push ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_TIMESTAMP}
-                                    
-                                    if [ "${DIST_NAME}" = "${LATEST}" ]; then
-                                        buildah push ${BASENAME}:latest-${ARCH_NAME}
-                                    fi
-                                """
+                            
+                            stage('Security') {
+                                when { expression { params.RUN_SECURITY_SCAN } }
+                                steps {
+                                    container('trivy') {
+                                        sh """
+                                            mkdir -p build/security
+                                            trivy image \
+                                                --input "build/${DIST_NAME}-${ARCH_NAME}.tar" \
+                                                --severity HIGH,CRITICAL \
+                                                --format json \
+                                                --output build/security/trivy-${DIST_NAME}-${ARCH_NAME}.json || true
+                                        """
+                                    }
+                                }
+                            }
+                            
+                            stage('Push') {
+                                when { expression { params.PUSH_TO_REGISTRY } }
+                                steps {
+                                    container('builder') {
+                                        // SECURITY FIX: Usiamo \$ per le variabili sensibili
+                                        sh """
+                                            echo "Pushing..."
+                                            echo \$DOCKERHUB_PSW | buildah login -u \$DOCKERHUB_USR --password-stdin ${DOCKER_REGISTRY}
+                                            
+                                            buildah push ${BASENAME}:${DIST_NAME}-${ARCH_NAME}
+                                            buildah push ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_DATE}
+                                            buildah push ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_TIMESTAMP}
+                                            
+                                            if [ "${DIST_NAME}" = "${LATEST}" ]; then
+                                                buildah push ${BASENAME}:latest-${ARCH_NAME}
+                                            fi
+                                        """
+                                    }
+                                }
                             }
                         }
                     }
@@ -278,7 +294,8 @@ spec:
                     script {
                         def dists = env.BUILD_DISTS.split(',')
                         
-                        sh "echo \${DOCKERHUB_PSW} | buildah login -u \${DOCKERHUB_USR} --password-stdin ${DOCKER_REGISTRY}"
+                        // SECURITY FIX: Escape delle credenziali
+                        sh "echo \$DOCKERHUB_PSW | buildah login -u \$DOCKERHUB_USR --password-stdin ${DOCKER_REGISTRY}"
                         
                         dists.each { dist ->
                             sh """
