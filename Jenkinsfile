@@ -1,6 +1,5 @@
 pipeline {
-    // AGENT NONE: Non creiamo un pod "master" globale. 
-    // I pod verranno creati dinamicamente dentro la matrice.
+    // AGENT NONE: I pod vengono creati dinamicamente nella matrix
     agent none
     
     environment {
@@ -8,19 +7,16 @@ pipeline {
         DOCKER_REGISTRY = 'docker.io'
         LATEST = 'trixie'
         
-        // Credenziali globali
+        // Credenziali globali (queste funzionano anche senza agent)
         DOCKERHUB = credentials('dockerhub-credentials')
         SONAR_TOKEN = credentials('sonarqube-token')
         
-        GIT_COMMIT_SHORT = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
-        BUILD_DATE = sh(returnStdout: true, script: 'date -u +%Y%m%d').trim()
-        BUILD_TIMESTAMP = sh(returnStdout: true, script: 'date -u +%Y-%m-%dT%H:%M-%S').trim()
+        // RIMOSSI GLI 'sh' DA QUI PERCHE' CAUSAVANO L'ERRORE
     }
     
     options {
         buildDiscarder(logRotator(numToKeepStr: '30'))
         timestamps()
-        // Timeout globale di sicurezza
         timeout(time: 6, unit: 'HOURS')
         ansiColor('xterm')
     }
@@ -33,11 +29,8 @@ pipeline {
                     axis { name 'ARCH_NAME'; values 'amd64', 'arm64' }
                 }
                 
-                // DEFINIZIONE AGENT DINAMICO PER OGNI CELLA
-                // Ogni combinazione Distro/Arch avrà il suo Pod isolato
                 agent {
                     kubernetes {
-                        // Label univoca per distinguere i pod nel log di Jenkins
                         label "builder-${DIST_NAME}-${ARCH_NAME}-${UUID.randomUUID().toString()}"
                         yaml """
 apiVersion: v1
@@ -52,7 +45,6 @@ spec:
     runAsUser: 0
     fsGroup: 0
   
-  # CRUCIALE: Ogni Pod deve assicurarsi che QEMU sia attivo sul nodo in cui atterra
   initContainers:
   - name: register-qemu
     image: multiarch/qemu-user-static
@@ -73,8 +65,6 @@ spec:
     - name: BUILDAH_FORMAT
       value: "docker"
     resources:
-      # Richiesta "soft" bassa per permettere al cluster di schedulare i pod
-      # Limite "hard" alto per permettere a QEMU di usare la CPU se disponibile
       requests:
         memory: "1Gi"
         cpu: "1000m"
@@ -91,22 +81,31 @@ spec:
                 }
 
                 when {
-                    expression {
-                        // Filtro opzionale se vuoi testare solo una architettura specifica
-                        // env.BUILD_DISTS.split(',').contains(DIST_NAME) 
-                        return true
-                    }
+                    expression { return true }
                 }
                 
                 stages {
                     stage('Build & Push') {
                         steps {
                             container('builder') {
+                                // *** FIX QUI: Calcoliamo le variabili dentro il container ***
+                                script {
+                                    echo ">>> CALCULATING DYNAMIC VARIABLES"
+                                    // Installiamo git prima di usarlo (se non presente)
+                                    sh 'apt-get update -qq && apt-get install -y -qq git > /dev/null'
+                                    
+                                    env.GIT_COMMIT_SHORT = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+                                    env.BUILD_DATE = sh(returnStdout: true, script: 'date -u +%Y%m%d').trim()
+                                    env.BUILD_TIMESTAMP = sh(returnStdout: true, script: 'date -u +%Y-%m-%dT%H:%M-%S').trim()
+                                    
+                                    echo "Build Info: ${env.BUILD_DATE} - ${env.GIT_COMMIT_SHORT}"
+                                }
+
                                 // 1. SETUP AMBIENTE
                                 sh '''
                                     echo ">>> SETUP ENVIRONMENT (${DIST_NAME}-${ARCH_NAME})"
-                                    apt-get update -qq
-                                    apt-get install -y -qq buildah podman qemu-user-static debootstrap jq curl git dpkg-dev perl debian-archive-keyring > /dev/null
+                                    # Git lo abbiamo già installato sopra, installiamo il resto
+                                    apt-get install -y -qq buildah podman qemu-user-static debootstrap jq curl dpkg-dev perl debian-archive-keyring > /dev/null
                                     chmod +x mkimage import-buildah
                                 '''
                                 
@@ -120,14 +119,14 @@ spec:
                                 // 3. IMPORT TO BUILDAH
                                 sh """
                                     echo ">>> IMPORTING TARBALL"
-                                    ./import-buildah "build/${DIST_NAME}-${ARCH_NAME}.tar" "${BUILD_TIMESTAMP}" "${ARCH_NAME}" > image_id.txt
+                                    ./import-buildah "build/${DIST_NAME}-${ARCH_NAME}.tar" "${env.BUILD_TIMESTAMP}" "${ARCH_NAME}" > image_id.txt
                                     
                                     IMAGE_ID=\$(cat image_id.txt)
                                     echo "Image ID: \$IMAGE_ID"
                                     
                                     buildah tag \$IMAGE_ID ${BASENAME}:${DIST_NAME}-${ARCH_NAME}
-                                    buildah tag \$IMAGE_ID ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_DATE}
-                                    buildah tag \$IMAGE_ID ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_TIMESTAMP}
+                                    buildah tag \$IMAGE_ID ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${env.BUILD_DATE}
+                                    buildah tag \$IMAGE_ID ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${env.BUILD_TIMESTAMP}
                                     
                                     if [ "${DIST_NAME}" = "${LATEST}" ]; then
                                         buildah tag \$IMAGE_ID ${BASENAME}:latest-${ARCH_NAME}
@@ -142,10 +141,8 @@ spec:
                                 """
                                 
                                 // 5. SECURITY SCAN (Trivy)
-                                // Nota: Trivy gira in un altro container nello stesso pod
                             } // fine container builder
                             
-                            // Cambio container per Trivy
                             container('trivy') {
                                 script {
                                     if (params.RUN_SECURITY_SCAN) {
@@ -163,18 +160,16 @@ spec:
                                 }
                             }
                             
-                            // Torno al builder per il Push
                             container('builder') {
                                 script {
                                     if (params.PUSH_TO_REGISTRY) {
                                         echo ">>> PUSH TO REGISTRY"
-                                        // Usa \$ per evitare interpolazione insicura di Groovy
                                         sh """
                                             echo \$DOCKERHUB_PSW | buildah login -u \$DOCKERHUB_USR --password-stdin ${DOCKER_REGISTRY}
                                             
                                             buildah push ${BASENAME}:${DIST_NAME}-${ARCH_NAME}
-                                            buildah push ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_DATE}
-                                            buildah push ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_TIMESTAMP}
+                                            buildah push ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${env.BUILD_DATE}
+                                            buildah push ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${env.BUILD_TIMESTAMP}
                                             
                                             if [ "${DIST_NAME}" = "${LATEST}" ]; then
                                                 buildah push ${BASENAME}:latest-${ARCH_NAME}
@@ -189,9 +184,6 @@ spec:
             }
         }
         
-        // Questo stage crea i MANIFEST (multi-arch).
-        // Deve girare DOPO che la matrice ha finito tutto.
-        // Ha bisogno di un suo pod separato perché quelli della matrice sono stati distrutti.
         stage('Create Manifests') {
             when {
                 allOf {
@@ -211,8 +203,6 @@ metadata:
 spec:
   containers:
   - name: builder
-    # Qui possiamo usare l'immagine buildah upstream che è più leggera, 
-    # tanto non dobbiamo compilare nulla, solo fare manifest push
     image: quay.io/buildah/stable:v1.33
     command: [cat]
     tty: true
@@ -234,7 +224,6 @@ spec:
                                 buildah manifest rm ${BASENAME}:${dist} || true
                                 buildah manifest create ${BASENAME}:${dist}
                                 
-                                # Aggiungiamo le immagini che abbiamo pushato nello stage precedente
                                 buildah manifest add ${BASENAME}:${dist} docker://${BASENAME}:${dist}-amd64
                                 buildah manifest add ${BASENAME}:${dist} docker://${BASENAME}:${dist}-arm64
                                 
@@ -242,7 +231,6 @@ spec:
                             """
                         }
                         
-                        // Gestione speciale per 'latest'
                         if (dists.contains(env.LATEST)) {
                              sh """
                                 echo "Creating manifest for latest..."
