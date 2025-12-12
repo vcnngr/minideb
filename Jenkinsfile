@@ -55,7 +55,9 @@ spec:
         
         GIT_COMMIT_SHORT = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
         BUILD_DATE = sh(returnStdout: true, script: 'date -u +%Y%m%d').trim()
-        BUILD_TIMESTAMP = sh(returnStdout: true, script: 'date -u +%Y-%m-%dT%H-%M-%S').trim()
+        // FORMATO CRUCIALE: ISO 8601/RFC3339 (es. 2023-10-25T14:30:00Z)
+        // Questo formato è identico a quello che generava il tuo vecchio script bash.
+        BUILD_TIMESTAMP = sh(returnStdout: true, script: 'date -u +%Y-%m-%dT%H:%M:%SZ').trim()
     }
     
     parameters {
@@ -91,11 +93,13 @@ spec:
         stage('Setup') {
             steps {
                 container('builder') {
-                    // *** CORREZIONE QUI ***
-                    // Ho aggiunto 'podman' alla lista dei pacchetti da installare
+                    // Installazione dipendenze:
+                    // - debootstrap: per mkimage
+                    // - podman: per i test (podman run)
+                    // - jq/git: utility
                     sh '''
                         echo "Installing dependencies..."
-                        dnf install -y debootstrap jq debian-keyring qemu-user-static podman > /dev/null
+                        dnf install -y debootstrap jq debian-keyring qemu-user-static podman git > /dev/null
                         
                         echo "Check tools:"
                         buildah --version
@@ -107,13 +111,12 @@ spec:
             }
         }
         
-        // Stage SonarQube (se lo usi, altrimenti può essere rimosso o ignorato)
         stage('Code Quality') {
              parallel {
                 stage('Shellcheck') {
                     steps {
                         container('builder') {
-                             sh 'echo "Skipping shellcheck due to missing tool in base image" || true'
+                             sh 'echo "Skipping shellcheck check in builder" || true'
                         }
                     }
                 }
@@ -165,7 +168,7 @@ spec:
                                     echo "Building Base RootFS for ${DIST_NAME}-${ARCH_NAME}"
                                     mkdir -p build
                                     
-                                    # Generazione rootfs
+                                    # Generazione rootfs con debootstrap
                                     ./mkimage "build/${DIST_NAME}-${ARCH_NAME}.tar" "${DIST_NAME}" "${ARCH_NAME}"
                                 """
                             }
@@ -176,13 +179,13 @@ spec:
                         steps {
                             container('builder') {
                                 sh """
-                                    # Import con Buildah
+                                    # Import con Buildah usando il timestamp per riproducibilità
                                     ./import-buildah "build/${DIST_NAME}-${ARCH_NAME}.tar" "${BUILD_TIMESTAMP}" "${ARCH_NAME}" > image_id.txt
                                     
                                     IMAGE_ID=\$(cat image_id.txt)
                                     echo "Created Image ID: \$IMAGE_ID"
                                     
-                                    # Tagging
+                                    # Tagging locale
                                     buildah tag \$IMAGE_ID ${BASENAME}:${DIST_NAME}-${ARCH_NAME}
                                     buildah tag \$IMAGE_ID ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_DATE}
                                     buildah tag \$IMAGE_ID ${BASENAME}:${DIST_NAME}-${ARCH_NAME}-${BUILD_TIMESTAMP}
@@ -203,7 +206,7 @@ spec:
                                 sh """
                                     echo "Testing ${DIST_NAME}-${ARCH_NAME}"
                                     
-                                    # Ora Podman è installato e funzionerà
+                                    # Podman run sostituisce docker run
                                     podman run --rm ${BASENAME}:${DIST_NAME}-${ARCH_NAME} cat /etc/os-release | head -2
                                     podman run --rm ${BASENAME}:${DIST_NAME}-${ARCH_NAME} dpkg --print-architecture
                                 """
