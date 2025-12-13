@@ -1,17 +1,14 @@
 pipeline {
-    // AGENT NONE: I pod vengono creati dinamicamente nella matrix
     agent none
     
     environment {
         BASENAME = 'vcnngr/minideb'
         DOCKER_REGISTRY = 'docker.io'
         LATEST = 'trixie'
-        
-        // Credenziali globali (queste funzionano anche senza agent)
         DOCKERHUB = credentials('dockerhub-credentials')
         SONAR_TOKEN = credentials('sonarqube-token')
         
-        // RIMOSSI GLI 'sh' DA QUI PERCHE' CAUSAVANO L'ERRORE
+        // Calcolo variabili al volo per evitare errori di contesto
     }
     
     options {
@@ -45,6 +42,11 @@ spec:
     runAsUser: 0
     fsGroup: 0
   
+  # VOLUMI: Aggiungiamo un volume veloce per le immagini
+  volumes:
+  - name: container-storage
+    emptyDir: {}
+
   initContainers:
   - name: register-qemu
     image: multiarch/qemu-user-static
@@ -59,9 +61,13 @@ spec:
     tty: true
     securityContext:
       privileged: true
+    volumeMounts:
+    - name: container-storage
+      mountPath: /var/lib/containers
     env:
+    # CAMBIO DRIVER: Overlay è 100x più veloce di VFS per debootstrap
     - name: STORAGE_DRIVER
-      value: "vfs"
+      value: "overlay"
     - name: BUILDAH_FORMAT
       value: "docker"
     resources:
@@ -88,35 +94,30 @@ spec:
                     stage('Build & Push') {
                         steps {
                             container('builder') {
-                                // *** FIX QUI: Calcoliamo le variabili dentro il container ***
                                 script {
-                                    echo ">>> CALCULATING DYNAMIC VARIABLES"
-                                    // Installiamo git prima di usarlo (se non presente)
+                                    // Calcolo variabili
                                     sh 'apt-get update -qq && apt-get install -y -qq git > /dev/null'
-                                    
                                     env.GIT_COMMIT_SHORT = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
                                     env.BUILD_DATE = sh(returnStdout: true, script: 'date -u +%Y%m%d').trim()
                                     env.BUILD_TIMESTAMP = sh(returnStdout: true, script: 'date -u +%Y-%m-%dT%H:%M-%S').trim()
-                                    
-                                    echo "Build Info: ${env.BUILD_DATE} - ${env.GIT_COMMIT_SHORT}"
                                 }
 
-                                // 1. SETUP AMBIENTE
                                 sh '''
                                     echo ">>> SETUP ENVIRONMENT (${DIST_NAME}-${ARCH_NAME})"
-                                    # Git lo abbiamo già installato sopra, installiamo il resto
                                     apt-get install -y -qq buildah podman qemu-user-static debootstrap jq curl dpkg-dev perl debian-archive-keyring > /dev/null
                                     chmod +x mkimage import-buildah
+                                    
+                                    # Fix per overlay su ext4 (opzionale ma consigliato)
+                                    # Se buildah si lamenta, decommenta la riga sotto:
+                                    # sed -i 's/^mountopt =.*/mountopt = "nodev,metacopy=on"/' /etc/containers/storage.conf || true
                                 '''
                                 
-                                // 2. CREATE BASE IMAGE (mkimage)
                                 sh """
                                     echo ">>> CREATE ROOTFS"
                                     mkdir -p build
                                     ./mkimage "build/${DIST_NAME}-${ARCH_NAME}.tar" "${DIST_NAME}" "${ARCH_NAME}"
                                 """
                                 
-                                // 3. IMPORT TO BUILDAH
                                 sh """
                                     echo ">>> IMPORTING TARBALL"
                                     ./import-buildah "build/${DIST_NAME}-${ARCH_NAME}.tar" "${env.BUILD_TIMESTAMP}" "${ARCH_NAME}" > image_id.txt
@@ -133,15 +134,12 @@ spec:
                                     fi
                                 """
                                 
-                                // 4. TEST (Podman)
                                 sh """
                                     echo ">>> TESTING IMAGE"
                                     podman run --rm ${BASENAME}:${DIST_NAME}-${ARCH_NAME} cat /etc/os-release | head -2
                                     podman run --rm ${BASENAME}:${DIST_NAME}-${ARCH_NAME} dpkg --print-architecture
                                 """
-                                
-                                // 5. SECURITY SCAN (Trivy)
-                            } // fine container builder
+                            }
                             
                             container('trivy') {
                                 script {
@@ -223,10 +221,8 @@ spec:
                                 echo "Creating manifest for ${dist}..."
                                 buildah manifest rm ${BASENAME}:${dist} || true
                                 buildah manifest create ${BASENAME}:${dist}
-                                
                                 buildah manifest add ${BASENAME}:${dist} docker://${BASENAME}:${dist}-amd64
                                 buildah manifest add ${BASENAME}:${dist} docker://${BASENAME}:${dist}-arm64
-                                
                                 buildah manifest push --all ${BASENAME}:${dist} docker://${BASENAME}:${dist}
                             """
                         }
